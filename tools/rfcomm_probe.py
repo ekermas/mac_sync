@@ -9,12 +9,33 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 
 ROOT = Path(__file__).resolve().parents[1]
 BLOCK = bytes(range(256)) * 16
 DIGEST = hashlib.sha256(BLOCK).hexdigest()
 REQUEST = b"MACSYNC-CP002\n" + BLOCK
 ACK = b"SHA256 " + DIGEST.encode() + b"\n"
+
+
+def read_callback_data(data, length):
+    # The formal protocol can override PyObjC's array metadata: void* then arrives
+    # as an integer address. Copy while still inside the native callback.
+    if not 0 <= length <= len(REQUEST):
+        raise ValueError("invalid_callback_length")
+    if isinstance(data, int):
+        if not data and length:
+            raise ValueError("null_callback_pointer")
+        import ctypes
+        return ctypes.string_at(data, length)
+    return bytes(data[:length])
+
+
+def error_details(exc):
+    return {"error_type": type(exc).__name__,
+            "error_message": re.sub(r"(?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}", "<address>", str(exc)),
+            "error_frames": [{"file": Path(f.filename).name, "line": f.lineno,
+                              "function": f.name} for f in traceback.extract_tb(exc.__traceback__)]}
 
 
 def arguments():
@@ -84,6 +105,8 @@ def run_worker(args):
                 self.done = False
                 self.error = None
                 self.verified = False
+                self.details = {}
+                self.sent = False
                 self.receiver = Receiver(REQUEST if args.role == "listen" else ACK)
             return self
 
@@ -125,12 +148,18 @@ def run_worker(args):
                 self.error = f"open_complete:{int(status)}"
                 return
             self.channel = channel
-            print("CONNECTED outgoing", flush=True)
-            self.send(REQUEST)
+            print(f"CONNECTED open_complete role={args.role}", flush=True)
+            if args.role == "connect" and not self.sent:
+                self.sent = True
+                try:
+                    self.send(REQUEST)
+                except Exception as exc:
+                    self.error = f"send:{type(exc).__name__}"
+                    self.details = error_details(exc)
 
         def rfcommChannelData_data_length_(self, channel, data, length):
             try:
-                if self.receiver.feed(bytes(data[:length])):
+                if self.receiver.feed(read_callback_data(data, length)):
                     if args.role == "listen":
                         payload = bytes(self.receiver.data)[len(b"MACSYNC-CP002\n"):]
                         if hashlib.sha256(payload).hexdigest() != DIGEST:
@@ -142,12 +171,17 @@ def run_worker(args):
                         self.done = True
             except Exception as exc:
                 self.error = f"receive:{type(exc).__name__}"
+                self.details = error_details(exc)
 
         def rfcommChannelWriteComplete_refcon_status_(self, channel, refcon, status):
             if status:
                 self.error = f"write_complete:{int(status)}"
             else:
-                self.next_write()
+                try:
+                    self.next_write()
+                except Exception as exc:
+                    self.error = f"write_next:{type(exc).__name__}"
+                    self.details = error_details(exc)
 
         def rfcommChannelClosed_(self, channel):
             if not self.done:
@@ -198,8 +232,10 @@ def run_worker(args):
         result.update(status="passed" if delegate.done and not delegate.error else "failed",
                       sha256_verified=delegate.verified,
                       reason=delegate.error or (None if delegate.done else "timeout"))
+        result.update(delegate.details)
     except Exception as exc:
         result.update(reason=str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__)
+        result.update(error_details(exc))
     finally:
         if delegate.channel is not None:
             delegate.channel.setDelegate_(None)
@@ -221,6 +257,7 @@ def main():
             result = run_worker(args)
         except Exception as exc:
             result = {"status": "failed", "reason": type(exc).__name__, "sha256_verified": False}
+            result.update(error_details(exc))
         print("RESULT " + json.dumps(result), flush=True)
         return
     # A hard deadline also covers native calls that might block the run loop.

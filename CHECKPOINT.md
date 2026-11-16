@@ -5,6 +5,24 @@
 
 ## CP002 — текущее состояние
 
+### Исправление после первой попытки раунда A
+
+- Пользователь сообщил peer-intel: status=failed, sha256_verified=false,
+  reason=TypeError. Полный traceback на Intel не получен.
+- local-arm64 действительно принял входящее подключение; старый listener
+  завершился с receive:TypeError, SHA-256 не проверен, сервис удалён (status=0).
+  Это подтверждает открытие канала, но не успешный обмен.
+- Изолированный вызов реального ObjC -> Python callback показал: указатель
+  данных приходит как int; срез data[:length] вызывает TypeError.
+  Исправлено копированием через ctypes.string_at внутри callback с проверкой длины.
+  Собственного C-кода нет.
+- Исправлена независимая ошибка: openComplete на listener тоже отправлял REQUEST.
+  Теперь REQUEST отправляет только connect, listener отвечает ACK после проверки.
+- tools/rfcomm_bridge_test.py проверяет настоящий native callback на локальном
+  буфере: PASS, pointer type=int. Self-test парсера и compileall также проходят.
+- Добавлены error_message и error_frames без Bluetooth-адресов для следующих ошибок.
+- Исправление пока проверено локально, повторный обмен с Intel ещё нужен.
+
 Пользователь согласовал диагностический spike. Создан tools/rfcomm_probe.py:
 listen/connect, фиксированный блок 4096 байт, SHA-256 ACK, таймаут supervisor,
 временный SDP-сервис и отдельные JSON-отчёты. Инструкция: docs/CP002.md.
